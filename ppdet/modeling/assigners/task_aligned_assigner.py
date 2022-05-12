@@ -32,10 +32,12 @@ __all__ = ['TaskAlignedAssigner']
 class TaskAlignedAssigner(nn.Layer):
     """TOOD: Task-aligned One-stage Object Detection
     """
+    __shared__ = ['num_classes']
 
-    def __init__(self, topk=13, alpha=1.0, beta=6.0, eps=1e-9):
+    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
         super(TaskAlignedAssigner, self).__init__()
         self.topk = topk
+        self.num_classes = num_classes
         self.alpha = alpha
         self.beta = beta
         self.eps = eps
@@ -80,8 +82,10 @@ class TaskAlignedAssigner(nn.Layer):
         assert gt_labels.ndim == gt_bboxes.ndim and \
                gt_bboxes.ndim == 3
 
-        batch_size, num_anchors, num_classes = pred_scores.shape
-        _, num_max_boxes, _ = gt_bboxes.shape
+        score_shape = paddle.shape(pred_scores)
+        batch_size = score_shape[0]
+        num_anchors = score_shape[1]
+        num_max_boxes = paddle.shape(gt_bboxes)[1]
 
         # negative batch
         if num_max_boxes == 0:
@@ -89,7 +93,7 @@ class TaskAlignedAssigner(nn.Layer):
                 [batch_size, num_anchors], bg_index, dtype=gt_labels.dtype)
             assigned_bboxes = paddle.zeros([batch_size, num_anchors, 4])
             assigned_scores = paddle.zeros(
-                [batch_size, num_anchors, num_classes])
+                [batch_size, num_anchors, self.num_classes])
             return assigned_labels, assigned_bboxes, assigned_scores
 
         # compute iou between gt and pred bbox, [B, n, L]
@@ -100,7 +104,7 @@ class TaskAlignedAssigner(nn.Layer):
             end=batch_size, dtype=gt_labels.dtype).unsqueeze(-1)
         gt_labels_ind = paddle.stack(
             [batch_ind.tile([1, num_max_boxes]), gt_labels.squeeze(-1)],
-            axis=-1)
+            axis=-1).cast('int32')
         bbox_cls_scores = paddle.gather_nd(pred_scores, gt_labels_ind)
         # compute alignment metrics, [B, n, L]
         alignment_metrics = bbox_cls_scores.pow(self.alpha) * ious.pow(
@@ -123,8 +127,9 @@ class TaskAlignedAssigner(nn.Layer):
         # the one with the highest iou will be selected, [B, n, L]
         mask_positive_sum = mask_positive.sum(axis=-2)
         if mask_positive_sum.max() > 1:
-            mask_multiple_gts = (mask_positive_sum.unsqueeze(1) > 1).tile(
-                [1, num_max_boxes, 1])
+            pos_mask = mask_positive_sum.unsqueeze(1) > 1
+            pos_mask.stop_gradient = True
+            mask_multiple_gts = pos_mask.tile([1, num_max_boxes, 1])
             is_max_iou = compute_max_iou_anchor(ious)
             mask_positive = paddle.where(mask_multiple_gts, is_max_iou,
                                          mask_positive)
@@ -138,14 +143,14 @@ class TaskAlignedAssigner(nn.Layer):
         assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
         assigned_labels = paddle.where(
             mask_positive_sum > 0, assigned_labels,
-            paddle.full_like(assigned_labels, bg_index))
+            paddle.full_like(assigned_labels, bg_index)).cast('int32')
 
         assigned_bboxes = paddle.gather(
             gt_bboxes.reshape([-1, 4]), assigned_gt_index.flatten(), axis=0)
         assigned_bboxes = assigned_bboxes.reshape([batch_size, num_anchors, 4])
 
-        assigned_scores = F.one_hot(assigned_labels, num_classes + 1)
-        ind = list(range(num_classes + 1))
+        assigned_scores = F.one_hot(assigned_labels, self.num_classes + 1)
+        ind = list(range(self.num_classes + 1))
         ind.remove(bg_index)
         assigned_scores = paddle.index_select(
             assigned_scores, paddle.to_tensor(ind), axis=-1)

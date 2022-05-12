@@ -308,7 +308,7 @@ class PPYOLOEHead(nn.Layer):
         gt_bboxes = gt_meta['gt_bbox']
         pad_gt_mask = gt_meta['pad_gt_mask']
         # label assignment
-        if gt_meta['epoch_id'] < self.static_assigner_epoch:
+        if gt_meta['epoch_id'] < paddle.to_tensor(self.static_assigner_epoch):
             assigned_labels, assigned_bboxes, assigned_scores = \
                 self.static_assigner(
                     anchors,
@@ -319,6 +319,7 @@ class PPYOLOEHead(nn.Layer):
                     bg_index=self.num_classes,
                     pred_bboxes=pred_bboxes.detach() * stride_tensor)
             alpha_l = 0.25
+            print('assigned_scores in static: ', assigned_scores.shape)
         else:
             assigned_labels, assigned_bboxes, assigned_scores = \
                 self.assigner(
@@ -331,10 +332,12 @@ class PPYOLOEHead(nn.Layer):
                 pad_gt_mask,
                 bg_index=self.num_classes)
             alpha_l = -1
+            print('assigned_scores in dynamic: ', assigned_scores.shape)
         # rescale bbox
         assigned_bboxes /= stride_tensor
         # cls loss
         if self.use_varifocal_loss:
+            assigned_labels = paddle.cast(assigned_labels, 'int32')
             one_hot_label = F.one_hot(assigned_labels,
                                       self.num_classes + 1)[..., :-1]
             loss_cls = self._varifocal_loss(pred_scores, assigned_scores,

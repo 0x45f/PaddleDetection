@@ -102,6 +102,28 @@ class Trainer(object):
             self.model = self.cfg.model
             self.is_loaded_weights = True
 
+        if cfg.get('to_static', False):
+            input_spec = [{
+                "im_id": InputSpec(
+                    shape=[-1, 1], name='im_id'),
+                "is_crowd": InputSpec(
+                    shape=[-1, -1, 1], name='is_crowd'),
+                "gt_class": InputSpec(
+                    shape=[-1, -1, 1], name='gt_class'),
+                "gt_bbox": InputSpec(
+                    shape=[-1, -1, 4], name='gt_bbox'),
+                "image": InputSpec(
+                    shape=[-1, 3, -1, -1], name='image'),
+                "im_shape": InputSpec(
+                    shape=[-1, 2], name='im_shape'),
+                "scale_factor": InputSpec(
+                    shape=[-1, 2], name='scale_factor'),
+                "pad_gt_mask": InputSpec(
+                    shape=[-1, -1, 1], name='pad_gt_mask')
+            }]
+
+            self.model = paddle.jit.to_static(self.model, input_spec=input_spec)
+
         if cfg.architecture == 'YOLOX':
             for k, m in self.model.named_sublayers():
                 if isinstance(m, nn.BatchNorm2D):
@@ -422,6 +444,9 @@ class Trainer(object):
             model.train()
             iter_tic = time.time()
             for step_id, data in enumerate(self.loader):
+                if step_id == 2:
+                    import sys
+                    sys.exit(1)
                 self.status['data_time'].update(time.time() - iter_tic)
                 self.status['step_id'] = step_id
                 profiler.add_profiler_step(profiler_options)

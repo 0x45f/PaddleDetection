@@ -119,8 +119,10 @@ class ATSSAssigner(nn.Layer):
         assert gt_labels.ndim == gt_bboxes.ndim and \
                gt_bboxes.ndim == 3
 
-        num_anchors, _ = anchor_bboxes.shape
-        batch_size, num_max_boxes, _ = gt_bboxes.shape
+        num_anchors = paddle.shape(anchor_bboxes)[0]
+        gt_bbox_shape = paddle.shape(gt_bboxes)
+        batch_size = gt_bbox_shape[0]
+        num_max_boxes = gt_bbox_shape[1]
 
         # negative batch
         if num_max_boxes == 0:
@@ -133,13 +135,14 @@ class ATSSAssigner(nn.Layer):
 
         # 1. compute iou between gt and anchor bbox, [B, n, L]
         ious = iou_similarity(gt_bboxes.reshape([-1, 4]), anchor_bboxes)
-        ious = ious.reshape([batch_size, -1, num_anchors])
+        num = paddle.shape(ious)[0] // batch_size
+        ious = ious.reshape([batch_size, num, num_anchors])
 
         # 2. compute center distance between all anchors and gt, [B, n, L]
         gt_centers = bbox_center(gt_bboxes.reshape([-1, 4])).unsqueeze(1)
         anchor_centers = bbox_center(anchor_bboxes)
         gt2anchor_distances = (gt_centers - anchor_centers.unsqueeze(0)) \
-            .norm(2, axis=-1).reshape([batch_size, -1, num_anchors])
+            .norm(2, axis=-1).reshape([batch_size, num, num_anchors])
 
         # 3. on each pyramid level, selecting topk closest candidates
         # based on the center distance, [B, n, L]
@@ -152,7 +155,10 @@ class ATSSAssigner(nn.Layer):
         iou_threshold = paddle.index_sample(
             iou_candidates.flatten(stop_axis=-2),
             topk_idxs.flatten(stop_axis=-2))
-        iou_threshold = iou_threshold.reshape([batch_size, num_max_boxes, -1])
+        sample_num = paddle.shape(iou_threshold)[-1]
+        iou_threshold = iou_threshold.reshape(
+            [batch_size, num_max_boxes, sample_num])
+
         iou_threshold = iou_threshold.mean(axis=-1, keepdim=True) + \
                         iou_threshold.std(axis=-1, keepdim=True)
         is_in_topk = paddle.where(
@@ -169,8 +175,9 @@ class ATSSAssigner(nn.Layer):
         # the one with the highest iou will be selected.
         mask_positive_sum = mask_positive.sum(axis=-2)
         if mask_positive_sum.max() > 1:
-            mask_multiple_gts = (mask_positive_sum.unsqueeze(1) > 1).tile(
-                [1, num_max_boxes, 1])
+            pos_mask = mask_positive_sum.unsqueeze(1) > 1
+            pos_mask.stop_gradient = True
+            mask_multiple_gts = pos_mask.tile([1, num_max_boxes, 1])
             is_max_iou = compute_max_iou_anchor(ious)
             mask_positive = paddle.where(mask_multiple_gts, is_max_iou,
                                          mask_positive)
@@ -178,8 +185,9 @@ class ATSSAssigner(nn.Layer):
         # 8. make sure every gt_bbox matches the anchor
         if self.force_gt_matching:
             is_max_iou = compute_max_iou_gt(ious) * pad_gt_mask
-            mask_max_iou = (is_max_iou.sum(-2, keepdim=True) == 1).tile(
-                [1, num_max_boxes, 1])
+            max_iou_mask = is_max_iou.sum(-2, keepdim=True) == 1
+            max_iou_mask.stop_gradient = True
+            mask_max_iou = max_iou_mask.tile([1, num_max_boxes, 1])
             mask_positive = paddle.where(mask_max_iou, is_max_iou,
                                          mask_positive)
             mask_positive_sum = mask_positive.sum(axis=-2)
@@ -194,7 +202,7 @@ class ATSSAssigner(nn.Layer):
         assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
         assigned_labels = paddle.where(
             mask_positive_sum > 0, assigned_labels,
-            paddle.full_like(assigned_labels, bg_index))
+            paddle.full_like(assigned_labels, bg_index)).cast('int32')
 
         assigned_bboxes = paddle.gather(
             gt_bboxes.reshape([-1, 4]), assigned_gt_index.flatten(), axis=0)
@@ -217,5 +225,4 @@ class ATSSAssigner(nn.Layer):
             gather_scores = paddle.where(mask_positive_sum > 0, gather_scores,
                                          paddle.zeros_like(gather_scores))
             assigned_scores *= gather_scores.unsqueeze(-1)
-
         return assigned_labels, assigned_bboxes, assigned_scores
