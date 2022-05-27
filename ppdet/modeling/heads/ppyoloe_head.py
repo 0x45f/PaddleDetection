@@ -166,7 +166,8 @@ class PPYOLOEHead(nn.Layer):
         stride_tensor = []
         for i, stride in enumerate(self.fpn_strides):
             if feats is not None:
-                _, _, h, w = feats[i].shape
+                # _, _, h, w = feats[i].shape
+                _, _, h, w = paddle.shape(feats[i])
             else:
                 h = int(self.eval_size[0] / stride)
                 w = int(self.eval_size[1] / stride)
@@ -267,7 +268,11 @@ class PPYOLOEHead(nn.Layer):
         # pos/neg loss
         if num_pos > 0:
             # l1 + iou
-            bbox_mask = mask_positive.unsqueeze(-1).tile([1, 1, 4])
+            # bbox_mask = mask_positive.unsqueeze(-1).tile([1, 1, 4])
+            tmp1 = mask_positive.unsqueeze(-1)
+            tmp1.stop_gradient = True
+            bbox_mask = tmp1.tile([1, 1, 4])
+            
             pred_bboxes_pos = paddle.masked_select(pred_bboxes,
                                                    bbox_mask).reshape([-1, 4])
             assigned_bboxes_pos = paddle.masked_select(
@@ -281,8 +286,12 @@ class PPYOLOEHead(nn.Layer):
                                      assigned_bboxes_pos) * bbox_weight
             loss_iou = loss_iou.sum() / assigned_scores_sum
 
-            dist_mask = mask_positive.unsqueeze(-1).tile(
-                [1, 1, (self.reg_max + 1) * 4])
+            # dist_mask = mask_positive.unsqueeze(-1).tile(
+            #     [1, 1, (self.reg_max + 1) * 4])
+            tmp2 = mask_positive.unsqueeze(-1)
+            tmp2.stop_gradient = True
+            dist_mask = tmp2.tile([1, 1, (self.reg_max + 1) * 4])
+
             pred_dist_pos = paddle.masked_select(
                 pred_dist, dist_mask).reshape([-1, 4, self.reg_max + 1])
             assigned_ltrb = self._bbox2distance(anchor_points, assigned_bboxes)
@@ -308,7 +317,7 @@ class PPYOLOEHead(nn.Layer):
         gt_bboxes = gt_meta['gt_bbox']
         pad_gt_mask = gt_meta['pad_gt_mask']
         # label assignment
-        if gt_meta['epoch_id'] < paddle.to_tensor(self.static_assigner_epoch):
+        if gt_meta['epoch_id'] < self.static_assigner_epoch:
             assigned_labels, assigned_bboxes, assigned_scores = \
                 self.static_assigner(
                     anchors,
@@ -331,7 +340,7 @@ class PPYOLOEHead(nn.Layer):
                 gt_bboxes,
                 pad_gt_mask,
                 bg_index=self.num_classes)
-            alpha_l = -1
+            alpha_l = -1.0
             print('assigned_scores in dynamic: ', assigned_scores.shape)
         # rescale bbox
         assigned_bboxes /= stride_tensor

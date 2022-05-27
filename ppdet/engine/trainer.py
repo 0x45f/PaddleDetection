@@ -105,21 +105,23 @@ class Trainer(object):
         if cfg.get('to_static', False):
             input_spec = [{
                 "im_id": InputSpec(
-                    shape=[-1, 1], name='im_id'),
+                    shape=[-1, 1], name='im_id', dtype='int64'),
                 "is_crowd": InputSpec(
-                    shape=[-1, -1, 1], name='is_crowd'),
+                    shape=[-1, -1, 1], name='is_crowd', dtype='int32'),
                 "gt_class": InputSpec(
-                    shape=[-1, -1, 1], name='gt_class'),
+                    shape=[-1, -1, 1], name='gt_class', dtype='int32'),
                 "gt_bbox": InputSpec(
-                    shape=[-1, -1, 4], name='gt_bbox'),
+                    shape=[-1, -1, 4], name='gt_bbox', dtype='float32'),
                 "image": InputSpec(
-                    shape=[-1, 3, -1, -1], name='image'),
+                    shape=[-1, 3, -1, -1], name='image', dtype='float32'),
                 "im_shape": InputSpec(
-                    shape=[-1, 2], name='im_shape'),
+                    shape=[-1, 2], name='im_shape', dtype='float32'),
                 "scale_factor": InputSpec(
-                    shape=[-1, 2], name='scale_factor'),
+                    shape=[-1, 2], name='scale_factor', dtype='float32'),
                 "pad_gt_mask": InputSpec(
-                    shape=[-1, -1, 1], name='pad_gt_mask')
+                    shape=[-1, -1, 1], name='pad_gt_mask', dtype='float32'),
+                "epoch_id":InputSpec(
+                    shape=[1], name='epoch_id', dtype='int32')
             }]
 
             self.model = paddle.jit.to_static(self.model, input_spec=input_spec)
@@ -451,7 +453,7 @@ class Trainer(object):
                 self.status['step_id'] = step_id
                 profiler.add_profiler_step(profiler_options)
                 self._compose_callback.on_step_begin(self.status)
-                data['epoch_id'] = epoch_id
+                data['epoch_id'] = paddle.to_tensor(epoch_id, dtype='int32')
 
                 if self.cfg.get('amp', False):
                     with amp.auto_cast(enable=self.cfg.use_gpu):
@@ -465,6 +467,7 @@ class Trainer(object):
                     # in dygraph mode, optimizer.minimize is equal to optimizer.step
                     scaler.minimize(self.optimizer, scaled_loss)
                 else:
+                    data.pop('curr_iter')
                     # model forward
                     outputs = model(data)
                     loss = outputs['loss']

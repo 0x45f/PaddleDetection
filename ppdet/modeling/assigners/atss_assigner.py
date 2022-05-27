@@ -54,13 +54,21 @@ class ATSSAssigner(nn.Layer):
         pad_gt_mask = pad_gt_mask.tile([1, 1, self.topk]).astype(paddle.bool)
         gt2anchor_distances_list = paddle.split(
             gt2anchor_distances, num_anchors_list, axis=-1)
-        num_anchors_index = np.cumsum(num_anchors_list).tolist()
+        # num_anchors_index = np.cumsum(num_anchors_list).tolist()
+        num_anchors_index = []
+        for i in range(len(num_anchors_list)):
+            if i == 0:
+                num_anchors_index.append(num_anchors_list[i])
+            else:
+                num_anchors_index.append(num_anchors_index[-1]+num_anchors_list[i])
+
         num_anchors_index = [0, ] + num_anchors_index[:-1]
         is_in_topk_list = []
         topk_idxs_list = []
         for distances, anchors_index in zip(gt2anchor_distances_list,
                                             num_anchors_index):
-            num_anchors = distances.shape[-1]
+            # num_anchors = distances.shape[-1]
+            num_anchors = paddle.shape(distances)[-1]
             topk_metrics, topk_idxs = paddle.topk(
                 distances, self.topk, axis=-1, largest=False)
             topk_idxs_list.append(topk_idxs + anchors_index)
@@ -133,96 +141,98 @@ class ATSSAssigner(nn.Layer):
                 [batch_size, num_anchors, self.num_classes])
             return assigned_labels, assigned_bboxes, assigned_scores
 
-        # 1. compute iou between gt and anchor bbox, [B, n, L]
-        ious = iou_similarity(gt_bboxes.reshape([-1, 4]), anchor_bboxes)
-        num = paddle.shape(ious)[0] // batch_size
-        ious = ious.reshape([batch_size, num, num_anchors])
+        else: # block3, grad_block21
+            # 1. compute iou between gt and anchor bbox, [B, n, L]
+            ious = iou_similarity(gt_bboxes.reshape([-1, 4]), anchor_bboxes)
+            num = paddle.shape(ious)[0] // batch_size
+            ious = ious.reshape([batch_size, num, num_anchors])
 
-        # 2. compute center distance between all anchors and gt, [B, n, L]
-        gt_centers = bbox_center(gt_bboxes.reshape([-1, 4])).unsqueeze(1)
-        anchor_centers = bbox_center(anchor_bboxes)
-        gt2anchor_distances = (gt_centers - anchor_centers.unsqueeze(0)) \
-            .norm(2, axis=-1).reshape([batch_size, num, num_anchors])
+            # 2. compute center distance between all anchors and gt, [B, n, L]
+            gt_centers = bbox_center(gt_bboxes.reshape([-1, 4])).unsqueeze(1)
+            anchor_centers = bbox_center(anchor_bboxes)
+            gt2anchor_distances = (gt_centers - anchor_centers.unsqueeze(0)) \
+                .norm(2, axis=-1).reshape([batch_size, num, num_anchors])
 
-        # 3. on each pyramid level, selecting topk closest candidates
-        # based on the center distance, [B, n, L]
-        is_in_topk, topk_idxs = self._gather_topk_pyramid(
-            gt2anchor_distances, num_anchors_list, pad_gt_mask)
+            # 3. on each pyramid level, selecting topk closest candidates
+            # based on the center distance, [B, n, L]
+            is_in_topk, topk_idxs = self._gather_topk_pyramid(
+                gt2anchor_distances, num_anchors_list, pad_gt_mask)
 
-        # 4. get corresponding iou for the these candidates, and compute the
-        # mean and std, 5. set mean + std as the iou threshold
-        iou_candidates = ious * is_in_topk
-        iou_threshold = paddle.index_sample(
-            iou_candidates.flatten(stop_axis=-2),
-            topk_idxs.flatten(stop_axis=-2))
-        sample_num = paddle.shape(iou_threshold)[-1]
-        iou_threshold = iou_threshold.reshape(
-            [batch_size, num_max_boxes, sample_num])
+            # 4. get corresponding iou for the these candidates, and compute the
+            # mean and std, 5. set mean + std as the iou threshold
+            iou_candidates = ious * is_in_topk
+            iou_threshold = paddle.index_sample(
+                iou_candidates.flatten(stop_axis=-2),
+                topk_idxs.flatten(stop_axis=-2))
+            sample_num = paddle.shape(iou_threshold)[-1]
+            iou_threshold = iou_threshold.reshape(
+                [batch_size, num_max_boxes, sample_num])
 
-        iou_threshold = iou_threshold.mean(axis=-1, keepdim=True) + \
-                        iou_threshold.std(axis=-1, keepdim=True)
-        is_in_topk = paddle.where(
-            iou_candidates > iou_threshold.tile([1, 1, num_anchors]),
-            is_in_topk, paddle.zeros_like(is_in_topk))
+            iou_threshold = iou_threshold.mean(axis=-1, keepdim=True) + \
+                            iou_threshold.std(axis=-1, keepdim=True)
+            is_in_topk = paddle.where(
+                iou_candidates > iou_threshold.tile([1, 1, num_anchors]),
+                is_in_topk, paddle.zeros_like(is_in_topk))
 
-        # 6. check the positive sample's center in gt, [B, n, L]
-        is_in_gts = check_points_inside_bboxes(anchor_centers, gt_bboxes)
+            # 6. check the positive sample's center in gt, [B, n, L]
+            is_in_gts = check_points_inside_bboxes(anchor_centers, gt_bboxes)
 
-        # select positive sample, [B, n, L]
-        mask_positive = is_in_topk * is_in_gts * pad_gt_mask
+            # select positive sample, [B, n, L]
+            mask_positive = is_in_topk * is_in_gts * pad_gt_mask
 
-        # 7. if an anchor box is assigned to multiple gts,
-        # the one with the highest iou will be selected.
-        mask_positive_sum = mask_positive.sum(axis=-2)
-        if mask_positive_sum.max() > 1:
-            pos_mask = mask_positive_sum.unsqueeze(1) > 1
-            pos_mask.stop_gradient = True
-            mask_multiple_gts = pos_mask.tile([1, num_max_boxes, 1])
-            is_max_iou = compute_max_iou_anchor(ious)
-            mask_positive = paddle.where(mask_multiple_gts, is_max_iou,
-                                         mask_positive)
+            # 7. if an anchor box is assigned to multiple gts,
+            # the one with the highest iou will be selected.
             mask_positive_sum = mask_positive.sum(axis=-2)
-        # 8. make sure every gt_bbox matches the anchor
-        if self.force_gt_matching:
-            is_max_iou = compute_max_iou_gt(ious) * pad_gt_mask
-            max_iou_mask = is_max_iou.sum(-2, keepdim=True) == 1
-            max_iou_mask.stop_gradient = True
-            mask_max_iou = max_iou_mask.tile([1, num_max_boxes, 1])
-            mask_positive = paddle.where(mask_max_iou, is_max_iou,
-                                         mask_positive)
-            mask_positive_sum = mask_positive.sum(axis=-2)
-        assigned_gt_index = mask_positive.argmax(axis=-2)
+            if mask_positive_sum.max() > 1: # block4, grad_block23
+                pos_mask = mask_positive_sum.unsqueeze(1) > 1
+                pos_mask.stop_gradient = True
+                mask_multiple_gts = pos_mask.tile([1, num_max_boxes, 1])
+                is_max_iou = compute_max_iou_anchor(ious)
+                mask_positive = paddle.where(mask_multiple_gts, is_max_iou,
+                                            mask_positive)
+                mask_positive_sum = mask_positive.sum(axis=-2)
 
-        # assigned target
-        batch_ind = paddle.arange(
-            end=batch_size, dtype=gt_labels.dtype).unsqueeze(-1)
-        assigned_gt_index = assigned_gt_index + batch_ind * num_max_boxes
-        assigned_labels = paddle.gather(
-            gt_labels.flatten(), assigned_gt_index.flatten(), axis=0)
-        assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
-        assigned_labels = paddle.where(
-            mask_positive_sum > 0, assigned_labels,
-            paddle.full_like(assigned_labels, bg_index)).cast('int32')
+            # 8. make sure every gt_bbox matches the anchor
+            if self.force_gt_matching:
+                is_max_iou = compute_max_iou_gt(ious) * pad_gt_mask
+                max_iou_mask = is_max_iou.sum(-2, keepdim=True) == 1
+                max_iou_mask.stop_gradient = True
+                mask_max_iou = max_iou_mask.tile([1, num_max_boxes, 1])
+                mask_positive = paddle.where(mask_max_iou, is_max_iou,
+                                            mask_positive)
+                mask_positive_sum = mask_positive.sum(axis=-2)
+            assigned_gt_index = mask_positive.argmax(axis=-2)
 
-        assigned_bboxes = paddle.gather(
-            gt_bboxes.reshape([-1, 4]), assigned_gt_index.flatten(), axis=0)
-        assigned_bboxes = assigned_bboxes.reshape([batch_size, num_anchors, 4])
+            # assigned target
+            batch_ind = paddle.arange(
+                end=batch_size, dtype=gt_labels.dtype).unsqueeze(-1)
+            assigned_gt_index = assigned_gt_index + batch_ind * num_max_boxes
+            assigned_labels = paddle.gather(
+                gt_labels.flatten(), assigned_gt_index.flatten(), axis=0)
+            assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
+            assigned_labels = paddle.where(
+                mask_positive_sum > 0, assigned_labels,
+                paddle.full_like(assigned_labels, bg_index)).cast('int32')
 
-        assigned_scores = F.one_hot(assigned_labels, self.num_classes + 1)
-        ind = list(range(self.num_classes + 1))
-        ind.remove(bg_index)
-        assigned_scores = paddle.index_select(
-            assigned_scores, paddle.to_tensor(ind), axis=-1)
-        if pred_bboxes is not None:
-            # assigned iou
-            ious = batch_iou_similarity(gt_bboxes, pred_bboxes) * mask_positive
-            ious = ious.max(axis=-2).unsqueeze(-1)
-            assigned_scores *= ious
-        elif gt_scores is not None:
-            gather_scores = paddle.gather(
-                gt_scores.flatten(), assigned_gt_index.flatten(), axis=0)
-            gather_scores = gather_scores.reshape([batch_size, num_anchors])
-            gather_scores = paddle.where(mask_positive_sum > 0, gather_scores,
-                                         paddle.zeros_like(gather_scores))
-            assigned_scores *= gather_scores.unsqueeze(-1)
-        return assigned_labels, assigned_bboxes, assigned_scores
+            assigned_bboxes = paddle.gather(
+                gt_bboxes.reshape([-1, 4]), assigned_gt_index.flatten(), axis=0)
+            assigned_bboxes = assigned_bboxes.reshape([batch_size, num_anchors, 4])
+
+            assigned_scores = F.one_hot(assigned_labels, self.num_classes + 1)
+            ind = list(range(self.num_classes + 1))
+            ind.remove(bg_index)
+            assigned_scores = paddle.index_select(
+                assigned_scores, paddle.to_tensor(ind), axis=-1)
+            if pred_bboxes is not None:
+                # assigned iou
+                ious = batch_iou_similarity(gt_bboxes, pred_bboxes) * mask_positive
+                ious = ious.max(axis=-2).unsqueeze(-1)
+                assigned_scores *= ious
+            elif gt_scores is not None:
+                gather_scores = paddle.gather(
+                    gt_scores.flatten(), assigned_gt_index.flatten(), axis=0)
+                gather_scores = gather_scores.reshape([batch_size, num_anchors])
+                gather_scores = paddle.where(mask_positive_sum > 0, gather_scores,
+                                            paddle.zeros_like(gather_scores))
+                assigned_scores *= gather_scores.unsqueeze(-1)
+            return assigned_labels, assigned_bboxes, assigned_scores

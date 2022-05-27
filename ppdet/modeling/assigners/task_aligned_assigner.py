@@ -95,73 +95,74 @@ class TaskAlignedAssigner(nn.Layer):
             assigned_scores = paddle.zeros(
                 [batch_size, num_anchors, self.num_classes])
             return assigned_labels, assigned_bboxes, assigned_scores
+        
+        else:
+            # compute iou between gt and pred bbox, [B, n, L]
+            ious = iou_similarity(gt_bboxes, pred_bboxes)
+            # gather pred bboxes class score
+            pred_scores = pred_scores.transpose([0, 2, 1])
+            batch_ind = paddle.arange(
+                end=batch_size, dtype=gt_labels.dtype).unsqueeze(-1)
+            gt_labels_ind = paddle.stack(
+                [batch_ind.tile([1, num_max_boxes]), gt_labels.squeeze(-1)],
+                axis=-1).cast('int32')
+            bbox_cls_scores = paddle.gather_nd(pred_scores, gt_labels_ind)
+            # compute alignment metrics, [B, n, L]
+            alignment_metrics = bbox_cls_scores.pow(self.alpha) * ious.pow(
+                self.beta)
 
-        # compute iou between gt and pred bbox, [B, n, L]
-        ious = iou_similarity(gt_bboxes, pred_bboxes)
-        # gather pred bboxes class score
-        pred_scores = pred_scores.transpose([0, 2, 1])
-        batch_ind = paddle.arange(
-            end=batch_size, dtype=gt_labels.dtype).unsqueeze(-1)
-        gt_labels_ind = paddle.stack(
-            [batch_ind.tile([1, num_max_boxes]), gt_labels.squeeze(-1)],
-            axis=-1).cast('int32')
-        bbox_cls_scores = paddle.gather_nd(pred_scores, gt_labels_ind)
-        # compute alignment metrics, [B, n, L]
-        alignment_metrics = bbox_cls_scores.pow(self.alpha) * ious.pow(
-            self.beta)
+            # check the positive sample's center in gt, [B, n, L]
+            is_in_gts = check_points_inside_bboxes(anchor_points, gt_bboxes)
 
-        # check the positive sample's center in gt, [B, n, L]
-        is_in_gts = check_points_inside_bboxes(anchor_points, gt_bboxes)
+            # select topk largest alignment metrics pred bbox as candidates
+            # for each gt, [B, n, L]
+            is_in_topk = gather_topk_anchors(
+                alignment_metrics * is_in_gts,
+                self.topk,
+                topk_mask=pad_gt_mask.tile([1, 1, self.topk]).astype(paddle.bool))
 
-        # select topk largest alignment metrics pred bbox as candidates
-        # for each gt, [B, n, L]
-        is_in_topk = gather_topk_anchors(
-            alignment_metrics * is_in_gts,
-            self.topk,
-            topk_mask=pad_gt_mask.tile([1, 1, self.topk]).astype(paddle.bool))
+            # select positive sample, [B, n, L]
+            mask_positive = is_in_topk * is_in_gts * pad_gt_mask
 
-        # select positive sample, [B, n, L]
-        mask_positive = is_in_topk * is_in_gts * pad_gt_mask
-
-        # if an anchor box is assigned to multiple gts,
-        # the one with the highest iou will be selected, [B, n, L]
-        mask_positive_sum = mask_positive.sum(axis=-2)
-        if mask_positive_sum.max() > 1:
-            pos_mask = mask_positive_sum.unsqueeze(1) > 1
-            pos_mask.stop_gradient = True
-            mask_multiple_gts = pos_mask.tile([1, num_max_boxes, 1])
-            is_max_iou = compute_max_iou_anchor(ious)
-            mask_positive = paddle.where(mask_multiple_gts, is_max_iou,
-                                         mask_positive)
+            # if an anchor box is assigned to multiple gts,
+            # the one with the highest iou will be selected, [B, n, L]
             mask_positive_sum = mask_positive.sum(axis=-2)
-        assigned_gt_index = mask_positive.argmax(axis=-2)
+            if mask_positive_sum.max() > 1:
+                pos_mask = mask_positive_sum.unsqueeze(1) > 1
+                pos_mask.stop_gradient = True
+                mask_multiple_gts = pos_mask.tile([1, num_max_boxes, 1])
+                is_max_iou = compute_max_iou_anchor(ious)
+                mask_positive = paddle.where(mask_multiple_gts, is_max_iou,
+                                            mask_positive)
+                mask_positive_sum = mask_positive.sum(axis=-2)
+            assigned_gt_index = mask_positive.argmax(axis=-2)
 
-        # assigned target
-        assigned_gt_index = assigned_gt_index + batch_ind * num_max_boxes
-        assigned_labels = paddle.gather(
-            gt_labels.flatten(), assigned_gt_index.flatten(), axis=0)
-        assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
-        assigned_labels = paddle.where(
-            mask_positive_sum > 0, assigned_labels,
-            paddle.full_like(assigned_labels, bg_index)).cast('int32')
+            # assigned target
+            assigned_gt_index = assigned_gt_index + batch_ind * num_max_boxes
+            assigned_labels = paddle.gather(
+                gt_labels.flatten(), assigned_gt_index.flatten(), axis=0)
+            assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
+            assigned_labels = paddle.where(
+                mask_positive_sum > 0, assigned_labels,
+                paddle.full_like(assigned_labels, bg_index)).cast('int32')
 
-        assigned_bboxes = paddle.gather(
-            gt_bboxes.reshape([-1, 4]), assigned_gt_index.flatten(), axis=0)
-        assigned_bboxes = assigned_bboxes.reshape([batch_size, num_anchors, 4])
+            assigned_bboxes = paddle.gather(
+                gt_bboxes.reshape([-1, 4]), assigned_gt_index.flatten(), axis=0)
+            assigned_bboxes = assigned_bboxes.reshape([batch_size, num_anchors, 4])
 
-        assigned_scores = F.one_hot(assigned_labels, self.num_classes + 1)
-        ind = list(range(self.num_classes + 1))
-        ind.remove(bg_index)
-        assigned_scores = paddle.index_select(
-            assigned_scores, paddle.to_tensor(ind), axis=-1)
-        # rescale alignment metrics
-        alignment_metrics *= mask_positive
-        max_metrics_per_instance = alignment_metrics.max(axis=-1, keepdim=True)
-        max_ious_per_instance = (ious * mask_positive).max(axis=-1,
-                                                           keepdim=True)
-        alignment_metrics = alignment_metrics / (
-            max_metrics_per_instance + self.eps) * max_ious_per_instance
-        alignment_metrics = alignment_metrics.max(-2).unsqueeze(-1)
-        assigned_scores = assigned_scores * alignment_metrics
+            assigned_scores = F.one_hot(assigned_labels, self.num_classes + 1)
+            ind = list(range(self.num_classes + 1))
+            ind.remove(bg_index)
+            assigned_scores = paddle.index_select(
+                assigned_scores, paddle.to_tensor(ind), axis=-1)
+            # rescale alignment metrics
+            alignment_metrics *= mask_positive
+            max_metrics_per_instance = alignment_metrics.max(axis=-1, keepdim=True)
+            max_ious_per_instance = (ious * mask_positive).max(axis=-1,
+                                                            keepdim=True)
+            alignment_metrics = alignment_metrics / (
+                max_metrics_per_instance + self.eps) * max_ious_per_instance
+            alignment_metrics = alignment_metrics.max(-2).unsqueeze(-1)
+            assigned_scores = assigned_scores * alignment_metrics
 
-        return assigned_labels, assigned_bboxes, assigned_scores
+            return assigned_labels, assigned_bboxes, assigned_scores

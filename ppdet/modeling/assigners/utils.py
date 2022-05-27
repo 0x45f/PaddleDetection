@@ -94,7 +94,8 @@ def gather_topk_anchors(metrics, topk, largest=True, topk_mask=None, eps=1e-9):
     Returns:
         is_in_topk (Tensor, float32): shape[B, n, L], value=1. means selected
     """
-    num_anchors = metrics.shape[-1]
+    # num_anchors = metrics.shape[-1]
+    num_anchors = paddle.shape(metrics)[-1]
     topk_metrics, topk_idxs = paddle.topk(
         metrics, topk, axis=-1, largest=largest)
     if topk_mask is None:
@@ -155,7 +156,8 @@ def compute_max_iou_anchor(ious):
     Returns:
         is_max_iou (Tensor, float32): shape[B, n, L], value=1. means selected
     """
-    num_max_boxes = ious.shape[-2]
+    # num_max_boxes = ious.shape[-2]
+    num_max_boxes = paddle.shape(ious)[-2]
     max_iou_index = ious.argmax(axis=-2)
     is_max_iou = F.one_hot(max_iou_index, num_max_boxes).transpose([0, 2, 1])
     return is_max_iou.astype(ious.dtype)
@@ -169,7 +171,7 @@ def compute_max_iou_gt(ious):
     Returns:
         is_max_iou (Tensor, float32): shape[B, n, L], value=1. means selected
     """
-    num_anchors = ious.shape[-1]
+    num_anchors = paddle.shape(ious)[-1]
     max_iou_index = ious.argmax(axis=-1)
     is_max_iou = F.one_hot(max_iou_index, num_anchors)
     return is_max_iou.astype(ious.dtype)
@@ -198,7 +200,8 @@ def generate_anchors_for_grid_cell(feats,
     num_anchors_list = []
     stride_tensor = []
     for feat, stride in zip(feats, fpn_strides):
-        _, _, h, w = feat.shape
+        # _, _, h, w = feat.shape
+        _, _, h, w = paddle.shape(feat)
         cell_half_size = grid_cell_size * stride * 0.5
         shift_x = (paddle.arange(end=w) + grid_cell_offset) * stride
         shift_y = (paddle.arange(end=h) + grid_cell_offset) * stride
